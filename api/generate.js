@@ -1,127 +1,77 @@
 export default async function handler(req, res) {
-  // 1. Set Headers for CORS (allows you to use this API anywhere)
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Content-Type', 'application/json');
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-
   const { prompt, type = 'video' } = req.query;
-
-  // 2. Validate Input
-  if (!prompt) {
-    return res.status(400).json({ 
-      success: false, 
-      error: "Missing 'prompt' parameter. Usage: /api/generate?prompt=your+text" 
-    });
-  }
+  if (!prompt) return res.status(400).json({ error: "Missing prompt" });
 
   try {
     const PAGE_URL = "https://veoaifree.com/veo-video-generator/";
     const AJAX_URL = "https://veoaifree.com/wp-admin/admin-ajax.php";
 
-    // 3. Step 1: Get the fresh Security Nonce from the site
+    // 1. Fetch page with realistic Android User-Agent
     const pageRes = await fetch(PAGE_URL, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0" }
+      headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" }
     });
     const html = await pageRes.text();
-    const nonceMatch = html.match(/"nonce"\s*:\s*"([a-zA-Z0-9]+)"/);
-    const nonce = nonceMatch ? nonceMatch[1] : null;
+    const nonce = html.match(/"nonce"\s*:\s*"([a-zA-Z0-9]+)"/)?.[1];
 
     if (!nonce) {
-      return res.status(500).json({ 
+      return res.status(403).json({ 
         success: false, 
-        error: "Security Handshake Failed", 
-        detail: "The source site may have updated or is blocking the server IP." 
+        error: "Nonce not found. The site might be blocking the API or showing a 'Share' wall.",
+        debug_snippet: html.slice(0, 300) 
       });
     }
 
-    // 4. Step 2: Request the Video/Image Generation
+    // 2. Request Generation
     const form = new URLSearchParams();
     form.append("action", type === "video" ? "veo_video_generator" : "veo_image_generator");
     form.append("actionType", type === "video" ? "whisk_final_video" : "whisk_final_image");
     form.append("nonce", nonce);
     form.append("promptText", prompt);
     form.append("totalImages", "1");
-    form.append("ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE");
 
     const apiRes = await fetch(AJAX_URL, {
       method: "POST",
       body: form,
       headers: {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": PAGE_URL,
-        "Origin": "https://veoaifree.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+        "Referer": PAGE_URL
       }
     });
 
-    const data = await apiRes.json();
-
-    // 5. Step 3: Handle the Local Data (Base64)
-    // The generator returns the file as a massive string because it's "local" to the browser
-    let base64 = data?.data_uri || data?.url || data?.video_uri;
-
-    if (!base64) {
+    // --- NEW: Check if response is actually JSON ---
+    const rawText = await apiRes.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
       return res.status(500).json({ 
         success: false, 
-        error: "Source site failed to return data", 
-        debug: data 
+        error: "Site returned HTML instead of JSON", 
+        site_says: rawText.slice(0, 500) // Show the first 500 characters of the error
       });
     }
 
-    // 6. Step 4: Convert Base64 string to a Binary Buffer for upload
-    const cleanBase64 = base64.includes("base64,") ? base64.split("base64,")[1] : base64;
+    let base64 = data?.data_uri || data?.url;
+    if (!base64) return res.status(500).json({ error: "No video data in response", raw: data });
+
+    // 3. Process and Upload
+    const cleanBase64 = base64.split("base64,")[1] || base64;
     const buffer = Buffer.from(cleanBase64, 'base64');
     
-    // Detect file type for the uploader
-    const mimeType = type === 'video' ? 'video/mp4' : 'image/png';
-    const fileName = type === 'video' ? 'gen_video.mp4' : 'gen_image.png';
+    const formData = new FormData();
+    formData.append("file", new Blob([buffer], { type: type === 'video' ? 'video/mp4' : 'image/png' }), "file.mp4");
 
-    // 7. Step 5: Upload to TmpFiles to get a permanent public link
-    const uploadFormData = new FormData();
-    const fileBlob = new Blob([buffer], { type: mimeType });
-    uploadFormData.append("file", fileBlob, fileName);
-
-    const uploadRes = await fetch("https://tmpfiles.org/api/v1/upload", {
-      method: "POST",
-      body: uploadFormData
-    });
-
+    const uploadRes = await fetch("https://tmpfiles.org/api/v1/upload", { method: "POST", body: formData });
     const uploadJson = await uploadRes.json();
+    const finalUrl = uploadJson.data.url.replace("tmpfiles.org/", "tmpfiles.org/dl/");
 
-    if (uploadJson.status !== "success") {
-      return res.status(500).json({ 
-        success: false, 
-        error: "Cloud upload failed", 
-        detail: uploadJson 
-      });
-    }
-
-    // Final direct link replacement
-    const finalDirectUrl = uploadJson.data.url.replace("tmpfiles.org/", "tmpfiles.org/dl/");
-
-    // 8. Return the Full Response
-    return res.status(200).json({
-      success: true,
-      timestamp: new Date().toISOString(),
-      request: {
-        prompt: prompt,
-        type: type
-      },
-      data: {
-        url: finalDirectUrl,
-        mimeType: mimeType,
-        provider: "Veo 3.1",
-        expires: "24 Hours"
-      }
-    });
+    res.status(200).json({ success: true, url: finalUrl });
 
   } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: "Internal Server Error",
-      message: err.toString()
-    });
+    res.status(500).json({ success: false, error: "Server Error", message: err.toString() });
   }
 }
