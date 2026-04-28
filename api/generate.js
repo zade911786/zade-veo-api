@@ -1,115 +1,83 @@
-// api/generate.js
-
 export default async function handler(req, res) {
-  const prompt = req.query.prompt;
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  const { prompt } = req.query;
 
   if (!prompt) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing prompt parameter",
-      example: "/api/generate?prompt=horse"
+    return res.status(400).json({ 
+      success: false, 
+      error: "Missing prompt parameter" 
     });
   }
 
+  const PAGE_URL = "https://veoaifree.com/veo-video-generator/";
+  const AJAX_URL = "https://veoaifree.com/wp-admin/admin-ajax.php";
+
   try {
-    // STEP 1: Get page HTML
-    const pageRes = await fetch("https://veoaifree.com/veo-video-generator/", {
+    // 1. Get Nonce
+    const pageRes = await fetch(PAGE_URL);
+    const html = await pageRes.text();
+    const nonceMatch = html.match(/"nonce"\s*:\s*"([a-zA-Z0-9]+)"/);
+    const nonce = nonceMatch ? nonceMatch[1] : null;
+
+    if (!nonce) throw new Error("Security nonce not found");
+
+    // 2. Generate Image
+    const form = new URLSearchParams();
+    form.append("action", "veo_video_generator");
+    form.append("nonce", nonce);
+    form.append("promptText", prompt);
+    form.append("totalImages", "1");
+    form.append("ratio", "IMAGE_ASPECT_RATIO_PORTRAIT");
+    form.append("actionType", "whisk_final_image");
+
+    const apiRes = await fetch(AJAX_URL, {
+      method: "POST",
+      body: form,
       headers: {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K)",
+        "x-requested-with": "XMLHttpRequest",
+        "origin": "https://veoaifree.com",
+        "referer": PAGE_URL
       }
     });
 
-    const html = await pageRes.text();
+    const data = await apiRes.json();
+    let base64 = data?.data_uri || "";
 
-    // STEP 2: Extract nonce/security
-    const patterns = [
-      /"nonce"\s*:\s*"([^"]+)"/i,
-      /"ajax_nonce"\s*:\s*"([^"]+)"/i,
-      /"security"\s*:\s*"([^"]+)"/i,
-      /nonce["']\s*[:=]\s*["']([^"']+)["']/i,
-      /name="nonce"\s*value="([^"]+)"/i,
-      /name="security"\s*value="([^"]+)"/i
-    ];
+    if (!base64) throw new Error("Image generation failed");
 
-    let nonce = null;
+    // 3. Process Base64 and Upload
+    const cleanBase64 = base64.includes("base64,") ? base64.split("base64,")[1] : base64;
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    
+    const uploadForm = new FormData();
+    const blob = new Blob([buffer], { type: "image/png" });
+    uploadForm.append("file", blob, "zade_gen.png");
 
-    for (const pattern of patterns) {
-      const match = html.match(pattern);
-      if (match) {
-        nonce = match[1];
-        break;
-      }
-    }
+    const uploadRes = await fetch("https://tmpfiles.org/api/v1/upload", {
+      method: "POST",
+      body: uploadForm
+    });
 
-    if (!nonce) {
-      return res.status(500).json({
-        success: false,
-        error: "Security nonce not found",
-        owner: "@zade4everbot"
-      });
-    }
+    const uploadJson = await uploadRes.json();
+    const finalUrl = uploadJson.data.url.replace("tmpfiles.org/", "tmpfiles.org/dl/");
 
-    // STEP 3: Generate image
-    const formData = new URLSearchParams();
-    formData.append("action", "veo_video_generator");
-    formData.append("security", nonce);
-    formData.append("promptText", prompt);
-    formData.append("totalImages", "1");
-    formData.append("ratio", "IMAGE_ASPECT_RATIO_PORTRAIT");
-    formData.append("actionType", "whisk_final_image");
-
-    const ajaxRes = await fetch(
-      "https://veoaifree.com/wp-admin/admin-ajax.php",
-      {
-        method: "POST",
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          "X-Requested-With": "XMLHttpRequest",
-          "Origin": "https://veoaifree.com",
-          "Referer": "https://veoaifree.com/veo-video-generator/",
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: formData.toString()
-      }
-    );
-
-    let result = {};
-    try {
-      result = await ajaxRes.json();
-    } catch {
-      result = {};
-    }
-
-    // STEP 4: Extract base64
-    let dataUri = result.data_uri || "";
-    let base64Image = null;
-
-    if (dataUri.includes("base64,")) {
-      base64Image = dataUri.split("base64,")[1];
-    } else if (dataUri) {
-      base64Image = dataUri;
-    }
-
-    if (!base64Image) {
-      return res.status(500).json({
-        success: false,
-        error: "Image generation failed",
-        raw: result
-      });
-    }
-
-    // STEP 5: Return base64 directly
+    // 4. Return Final JSON
     return res.status(200).json({
       success: true,
-      prompt,
-      image_base64: base64Image,
-      owner: "@zade4everbot"
+      prompt: prompt,
+      url: finalUrl,
+      owner: "@zade4everbot",
+      made_by: "Boss Zade"
     });
 
   } catch (err) {
     return res.status(500).json({
       success: false,
-      error: err.message
+      error: err.message,
+      owner: "@zade4everbot"
     });
   }
 }
